@@ -33,6 +33,45 @@ hold a key to talk, release, and hear the answer.
 - **Works with Claude Code and Codex CLI.** Registration scripts set up both,
   plus ChatGPT Desktop, which shares Codex's MCP configuration.
 
+## Install with Claude Code or Codex
+
+Let your AI assistant do the setup. It can clone the repo, build and start the
+engine, register the server and set up the speaking rules for you.
+
+**Install these yourself first.** They need administrator rights, a reboot or
+your own sign-in:
+
+- Windows 10 or 11 and an NVIDIA GPU with a current driver that supports CUDA 13.
+  Developed and tested on an RTX 5090; peak GPU memory measured about 4.7 GB.
+  Other recent NVIDIA GPUs should work if the PyTorch CUDA 13 build supports them.
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) using the
+  WSL2 backend with [GPU support](https://docs.docker.com/desktop/features/gpu/),
+  running.
+- [Git](https://git-scm.com/), [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows)
+  and [Python](https://www.python.org/downloads/windows/) 3.12 or 3.13, on your `PATH`.
+- [Claude Code](https://claude.com/claude-code) and/or
+  [Codex CLI](https://developers.openai.com/codex/cli), signed in.
+
+**Then** open a terminal in an empty folder, start `claude` or `codex`, and paste:
+
+```text
+Install Local Qwen Voice from https://github.com/BitwiseAnvil/local-qwen-voice on this PC.
+Clone it into this folder, read its README and follow "Install manually". First check the
+prerequisites and tell me what's missing instead of installing system software yourself.
+Run scripts/start.ps1 and wait for it to finish; the first run downloads several GB.
+Register the MCP server for the assistants I have installed (Claude Code, Codex or both).
+If Codex is installed, merge docs/codex-AGENTS.md into %USERPROFILE%\.codex\AGENTS.md
+without removing anything already there. When done, tell me to restart my assistants.
+```
+
+The assistant will ask before running commands; approve them as it goes. The
+first start downloads several GB of models and can take several minutes. **Codex
+users:** Codex's sandbox can block Docker, and the registration script refuses to
+run inside a sandbox account. Approve Codex's request to run those commands
+outside the sandbox, or run them yourself from a normal PowerShell terminal.
+When it's finished, restart Claude Code or Codex and ask them anything; you should
+hear a short spoken summary.
+
 ## How it works
 
 ```mermaid
@@ -56,18 +95,12 @@ use the Windows speakers. It uses only Python's standard library and the
 Windows audio API. All model inference runs in the container; there is no CPU
 inference path.
 
-## Requirements
+## Install manually
 
-- Windows 10 or 11 with Docker Desktop using the WSL2 backend and GPU support.
-- An NVIDIA GPU and a current driver that supports CUDA 13. Developed and tested
-  on an RTX 5090; peak GPU memory measured about 4.7 GB. Other recent NVIDIA GPUs
-  should work if the PyTorch CUDA 13 build supports them.
-- PowerShell 7 and Python 3.12 or 3.13 on Windows.
-- Claude Code and/or Codex CLI.
+Check the [prerequisites](#install-with-claude-code-or-codex) above, clone this
+repository, then:
 
-## Get started
-
-1. **Start the engine.** From this folder, in an ordinary PowerShell terminal:
+1. **Start the engine.** From the repository folder, in an ordinary PowerShell terminal:
 
    ```powershell
    .\scripts\start.ps1
