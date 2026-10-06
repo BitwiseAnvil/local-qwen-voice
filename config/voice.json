@@ -1,0 +1,9 @@
+{
+  "name": "audition_smooth_rounded",
+  "description": "An adult American woman speaking in a comfortable middle register. Smooth, rounded, velvety vocal tone with full, clear resonance. Broad flowing vowels, soft consonant edges, and gently connected phrases. Easy, unhurried conversational rhythm with a warm, reassuring presence. The voice sounds naturally feminine and mature. Clean dry studio speech.",
+  "language": "English",
+  "reference_text": "Hello, I'm here to help. We can work through your ideas together, one step at a time. Tell me what you're thinking, and I'll keep things clear, practical, and easy to follow.",
+  "seed": 42,
+  "design_model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "base_model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+}

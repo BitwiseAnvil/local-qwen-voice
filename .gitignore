@@ -1,0 +1,8 @@
+.env
+.runtime/
+__pycache__/
+*.py[cod]
+.venv/
+
+.claude/settings.local.json
+.mcp.json

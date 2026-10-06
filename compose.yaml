@@ -1,0 +1,44 @@
+name: local-qwen-voice
+services:
+  tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: "on-failure:3"
+    ports:
+      - "127.0.0.1:${TTS_PORT:-8765}:8765"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      EXPECTED_GPU_NAME: ${TTS_EXPECTED_GPU:-}
+      TTS_CHUNK_FRAMES: ${TTS_CHUNK_FRAMES:-4}
+      HF_HOME: /models/huggingface
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      VOICE_DATA_DIR: /data/voices
+      VOICE_CONFIG: /app/config/voice.json
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - model-cache:/models
+      - voice-data:/data
+      - ./config/voice.json:/app/config/voice.json:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${TTS_GPU_DEVICE:-0}"]
+              capabilities: [gpu]
+    shm_size: 2gb
+    healthcheck:
+      test: ["CMD", "python", "-m", "local_voice.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20m
+      retries: 3
+    stop_grace_period: 30s
+
+volumes:
+  model-cache:
+  voice-data:

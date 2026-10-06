@@ -1,0 +1,5 @@
+# Preserve the CUDA 13 wheels and the accelerated backend's Transformers 5 API.
+torch==2.11.0
+torchaudio==2.11.0
+transformers==5.15.1
+accelerate==1.12.0

@@ -1,0 +1,2 @@
+faster-qwen3-tts==0.5.3
+qwen-tts-hf==0.1.1.post1
