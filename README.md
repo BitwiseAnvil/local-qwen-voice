@@ -28,6 +28,9 @@ hold a key to talk, release, and hear the answer.
   to design more voices at any time.
 - **Stops when you say so.** Say "stop" or "quiet" and speech cancels
   immediately for that reply.
+- **Gives the GPU back when idle.** After two minutes without speech, the model
+  moves to host RAM, freeing about 5.5 GB of VRAM. The next reply brings it back
+  in about a second.
 - **Stays private.** Text goes only to a container on `127.0.0.1`. After the
   models download, you can turn off network access to Hugging Face entirely.
 - **Works with Claude Code and Codex CLI.** Registration scripts set up both,
@@ -196,10 +199,63 @@ Copy `.env.example` to `.env` to change these settings:
 | `TTS_EXPECTED_GPU` | *(empty)* | If set, refuse to start unless the GPU name contains this text, e.g. `RTX 5090`. |
 | `TTS_PORT` | `8765` | Port published on `127.0.0.1` only. |
 | `TTS_CHUNK_FRAMES` | `4` | Codec frames per packet, 1-12, about a third of a second of audio at 4. Smaller can start sooner at more overhead. |
+| `TTS_IDLE_UNLOAD_SECONDS` | `120` | Seconds without speech before the model leaves GPU memory; `0` keeps it loaded. See [Idle GPU memory](#idle-gpu-memory). |
 | `HF_HUB_OFFLINE` | `0` | Set to `1` after both models are cached to block Hugging Face access. |
 
 The bridge reads the same `TTS_PORT` from `.env`; `TTS_URL` can override it with
 another localhost URL. Changes take effect after `docker compose up -d`.
+
+## Idle GPU memory
+
+When no speech has been requested for `TTS_IDLE_UNLOAD_SECONDS` (two minutes by
+default), the engine *parks* the model: it copies the weights into a page-locked
+buffer in host RAM and releases their GPU memory along with the CUDA graphs and
+their static caches. The next request restores the weights over PCIe and
+recaptures the graphs. It doesn't reload from disk. Nothing is lost, and nothing
+fails while this happens:
+
+- A request that finds the model parked waits for the restore and is then served
+  normally. Requests that arrive during a restore queue behind it. The service
+  stays `ready` throughout, so assistants never see a "still loading" error.
+- The model is never parked while a request is generating, streaming or waiting.
+  The idle timer restarts when each request finishes.
+- If the GPU is out of memory when a request arrives, the restore is rolled back,
+  that request reports the error, and the next request tries again.
+
+Measured on an RTX 5090 under Docker Desktop (WSL2):
+
+| | |
+| --- | --- |
+| GPU memory freed by parking | about 5.5 GB (`nvidia-smi`): the container drops from about 6.2 GB to 0.7 GB |
+| Still held while parked | about 0.7 GB for the process's CUDA context and loaded kernels; only stopping the container releases it |
+| Park | about 0.35 s |
+| Restore | about 1.1 s: 0.16 s for weights, about 1 s to recapture CUDA graphs |
+| First audio when a request finds the model parked | about 1.5 s, instead of about 0.2 s |
+| First audio when a `/wake` hint arrives at least 1.5 s earlier | about 0.2 s, the same as if it had never been parked |
+| Steady-state speed | unchanged |
+| Host RAM | about 4 GB more, page-locked once at startup and reused |
+
+Restores take longer, up to about 2 s, while other work is using the GPU.
+
+**Pre-warming.** `POST /wake` starts the restore in the background and returns
+immediately, so a client can hide it entirely. For example, a client could call it
+when you submit a prompt, while the assistant is still writing its answer. It
+also restarts the idle timer. An optional `keep_resident_seconds` (up to 3600)
+keeps the model loaded at least that long:
+
+```powershell
+curl.exe -s -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:8765/wake
+python -m local_voice.cli wake --keep-resident 600
+```
+
+As a Claude Code `UserPromptSubmit` hook, use `curl -s -m 2 -o NUL -X POST -H
+"Content-Type: application/json" -d "{}" http://127.0.0.1:8765/wake`. `-o NUL`
+matters because that hook's output is added to the prompt.
+
+`GET /health`, and the `engine` section of `speech_status`, report `residency`
+(`resident`, `parking`, `parked` or `waking`), `idle_seconds`,
+`last_wake_seconds`, wake and park counts, and the details of the last of each.
+Set `TTS_IDLE_UNLOAD_SECONDS=0` to keep the model loaded permanently, as before.
 
 Downloaded weights live in the `model-cache` Docker volume and voices in
 `voice-data`. `docker compose down` keeps them; `docker compose down -v` deletes
@@ -213,6 +269,7 @@ them. Playback stays in memory; only the benchmark sample is saved, to
 .\scripts\smoke.ps1 -Play      # also verifies real CUDA synthesis and plays it
 python -m local_voice.cli benchmark --runs 3 --play --require-interactive
 python -m local_voice.cli health
+python -m local_voice.cli wake  # restore a parked model now
 docker compose logs --tail 100 tts
 docker compose stop
 ```
@@ -228,7 +285,8 @@ any time queued behind other jobs.
 The benchmark rejects silent, malformed or truncated audio, but it can't judge
 pronunciation or voice quality; listen to the sample for that. Unit tests cover
 HTTP streaming, buffer lifetime, overlapping generation and playback,
-cancellation, error handling and the MCP handshake without a GPU.
+cancellation, error handling, idle parking and waking, and the MCP handshake
+without a GPU. The benchmark wakes a parked model before measuring.
 
 If Docker reports permission denied for `dockerDesktopLinuxEngine`, run the
 command from your normal Windows terminal where Docker Desktop is accessible.
