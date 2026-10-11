@@ -70,8 +70,12 @@ def cancellable_lock(lock, event):
         lock.release()
 
 
-def verify_cuda_parameters(wrapper):
-    """Check actual model and audio-tokenizer tensors, not just a device label."""
+def _aligned(nbytes, alignment=4096):
+    return -(-nbytes // alignment) * alignment
+
+
+def torch_components(wrapper):
+    """The torch modules holding a wrapper's weights: the TTS model and its audio tokenizer."""
     model = wrapper
     for _ in range(3):
         if hasattr(model, "named_parameters"):
@@ -82,6 +86,12 @@ def verify_cuda_parameters(wrapper):
     tokenizer_model = getattr(tokenizer, "model", None)
     if tokenizer_model is not None:
         components.append(tokenizer_model)
+    return components
+
+
+def verify_cuda_parameters(wrapper):
+    """Check actual model and audio-tokenizer tensors, not just a device label."""
+    components = torch_components(wrapper)
     count = 0
     for component in components:
         for name, parameter in component.named_parameters():
@@ -91,6 +101,56 @@ def verify_cuda_parameters(wrapper):
     if not count:
         raise RuntimeError("Could not verify model parameters on CUDA")
     return count
+
+
+def tensor_slots(components, device_type):
+    """Parameter and buffer slots on one device type, as (table, name, is_parameter)."""
+    slots = []
+    seen = set()
+    for component in components:
+        for module in component.modules():
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            for table, is_parameter in ((module._parameters, True), (module._buffers, False)):
+                for name, tensor in table.items():
+                    if tensor is not None and tensor.device.type == device_type:
+                        slots.append((table, name, is_parameter))
+    return slots
+
+
+def unique_tensors(slots):
+    """Slots with the tensor each holds and a key shared by tied tensors."""
+    entries = []
+    seen = set()
+    for table, name, is_parameter in slots:
+        tensor = table[name]
+        if is_parameter:
+            if id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+        key = (tensor.untyped_storage().data_ptr(), tensor.storage_offset(),
+               tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+        entries.append((table, name, is_parameter, tensor, key))
+    return entries
+
+
+def move_tensors(slots, convert):
+    """Re-home parameters and buffers in place; tied tensors keep sharing one copy.
+
+    Parameters keep their identity (only .data changes), so modules, hooks and
+    tied weights still reference the same objects. Buffers are replaced in
+    their module's table.
+    """
+    converted = {}
+    for table, name, is_parameter, tensor, key in unique_tensors(slots):
+        if key not in converted:
+            converted[key] = convert(tensor)
+        if is_parameter:
+            tensor.data = converted[key]
+        else:
+            table[name] = converted[key]
+    return len(converted)
 
 
 @contextmanager
@@ -138,6 +198,27 @@ class QwenEngine:
         if not 1 <= self.chunk_size <= 12:
             raise ValueError("TTS_CHUNK_FRAMES must be between 1 and 12")
         self.warmed_voices = set()
+        # Idle unload: park the Base model's weights in pinned host RAM and drop
+        # its CUDA graphs, then restore them when speech is next requested.
+        self.idle_unload_seconds = float(os.environ.get("TTS_IDLE_UNLOAD_SECONDS", "0"))
+        if not 0 <= self.idle_unload_seconds <= 86400:
+            raise ValueError("TTS_IDLE_UNLOAD_SECONDS must be between 0 (never) and 86400")
+        self.residency = None
+        self.parked_slots = None
+        self.parked_views = None
+        self.graph_settings = None
+        self.host_buffer = None
+        self.host_pinned = False
+        self.host_cursor = 0
+        self.pending = 0
+        self.last_activity = time.monotonic()
+        self.keep_resident_until = 0.0
+        self.wake_thread = None
+        self.idle_thread = None
+        self.wake_count = 0
+        self.park_count = 0
+        self.last_wake = None
+        self.last_park = None
 
     def initialize(self):
         try:
@@ -168,9 +249,18 @@ class QwenEngine:
                         raise RuntimeError("Default voice description changed. Choose a new voice name to redesign it.")
                 self._load_model("base")
                 self._warm_voice(name)
+                if self.idle_unload_seconds:
+                    # Page-locking host memory takes seconds; do it once at startup
+                    # rather than in the first park, when a request might be waiting.
+                    self._reserve_host(self._park_bytes(tensor_slots(torch_components(self.model), "cuda")))
             with self.state_lock:
                 self.state = "ready"
+                self.last_activity = time.monotonic()
             log.info("Ready on %s; default voice: %s", self.gpu, name)
+            if self.idle_unload_seconds:
+                log.info("Idle unload enabled: parking the model after %gs without requests", self.idle_unload_seconds)
+                self.idle_thread = threading.Thread(target=self._idle_monitor, daemon=True, name="idle-unload")
+                self.idle_thread.start()
         except Exception as exc:
             log.exception("Engine initialization failed")
             with self.state_lock:
@@ -178,6 +268,12 @@ class QwenEngine:
                 self.error = str(exc)
 
     def health(self):
+        reserved = None
+        if self.gpu:
+            try:
+                reserved = round(self.torch.cuda.memory_reserved() / 1024**2, 1)
+            except Exception:
+                pass
         with self.state_lock:
             return {
                 "status": self.state,
@@ -195,24 +291,300 @@ class QwenEngine:
                 "streaming_protocol": 1,
                 "chunk_frames": self.chunk_size,
                 "cuda_graphs": bool(self.model_kind == "base" and getattr(self.model, "_warmed_up", False)),
+                # resident, parking, parked (weights in host RAM) or waking.
+                # Requests made while parked wait for the wake and then succeed.
+                "residency": self.residency,
+                "parked": self.residency == "parked",
+                "idle_unload_seconds": self.idle_unload_seconds,
+                "idle_seconds": round(time.monotonic() - self.last_activity, 1),
+                "active_requests": self.pending,
+                "keep_resident_seconds": round(max(0.0, self.keep_resident_until - time.monotonic()), 1),
+                "torch_reserved_mb": reserved,
+                "wake_count": self.wake_count,
+                "park_count": self.park_count,
+                "last_wake_seconds": self.last_wake and self.last_wake["seconds"],
+                # Copies: a background wake adds warm_seconds after publishing.
+                "last_wake": self.last_wake and dict(self.last_wake),
+                "last_park": self.last_park and dict(self.last_park),
             }
+
+    @contextmanager
+    def _gpu_session(self, event):
+        """Hold the GPU for one request. Pending requests block idle unload;
+        the idle timer restarts when the request releases the GPU."""
+        with self.state_lock:
+            self.pending += 1
+            self.last_activity = time.monotonic()
+        try:
+            with cancellable_lock(self.gpu_lock, event):
+                yield
+        finally:
+            with self.state_lock:
+                self.pending -= 1
+                self.last_activity = time.monotonic()
+
+    def _idle_expired(self):
+        with self.state_lock:
+            now = time.monotonic()
+            return (self.idle_unload_seconds > 0 and self.state == "ready"
+                    and self.residency == "resident" and self.model_kind == "base"
+                    and self.pending == 0 and now >= self.keep_resident_until
+                    and now - self.last_activity >= self.idle_unload_seconds)
+
+    def park_if_idle(self):
+        """Park the model if it has been idle long enough; never waits for the GPU."""
+        if not self._idle_expired() or not self.gpu_lock.acquire(blocking=False):
+            return False
+        try:
+            # Re-check under the GPU lock: a request may have just arrived.
+            if not self._idle_expired():
+                return False
+            self._park("idle")
+            return True
+        finally:
+            self.gpu_lock.release()
+
+    def _idle_monitor(self):
+        interval = min(5.0, max(0.25, self.idle_unload_seconds / 10))
+        while True:
+            time.sleep(interval)
+            try:
+                self.park_if_idle()
+            except Exception:
+                log.exception("Idle unload failed")
+
+    def request_wake(self, keep_resident_seconds=0):
+        """Start restoring a parked model in the background and return at once.
+
+        Clients call this when speech is likely soon (for example, as a prompt is
+        submitted) so the restore overlaps their own work. It also restarts the
+        idle timer, and can hold the model resident for up to an hour.
+        """
+        if isinstance(keep_resident_seconds, bool) or not isinstance(keep_resident_seconds, (int, float)):
+            raise ValueError("keep_resident_seconds must be a number")
+        if not 0 <= keep_resident_seconds <= 3600:
+            raise ValueError("keep_resident_seconds must be between 0 and 3600")
+        with self.state_lock:
+            now = time.monotonic()
+            self.last_activity = now
+            self.keep_resident_until = max(self.keep_resident_until, now + keep_resident_seconds)
+            started = (self.state == "ready" and self.residency in ("parked", "parking")
+                       and not (self.wake_thread and self.wake_thread.is_alive()))
+            if started:
+                self.wake_thread = threading.Thread(target=self._background_wake, daemon=True, name="model-wake")
+                self.wake_thread.start()
+        return dict(self.health(), wake_started=started)
+
+    def _background_wake(self):
+        try:
+            with self._gpu_session(threading.Event()):
+                if self.state == "ready":
+                    wakes = self.wake_count
+                    self._load_model("base", reason="wake request")
+                    with self.state_lock:
+                        waiting = self.pending > 1
+                    if self.wake_count != wakes and not waiting:
+                        # Nobody is waiting yet, so also pay the first generation's
+                        # one-time setup (about 0.2 s) now rather than in the next
+                        # request. One audio chunk covers it.
+                        started = time.perf_counter()
+                        self._warm_voice(self.config["name"], force=True, first_chunk_only=True)
+                        with self.state_lock:
+                            self.last_wake["warm_seconds"] = round(time.perf_counter() - started, 3)
+        except Exception:
+            log.exception("Background wake failed; the next request will retry")
+
+    def _park(self, reason):
+        """Move Base weights to host RAM and free CUDA graphs. Caller holds gpu_lock."""
+        torch = self.torch
+        started = time.perf_counter()
+        reserved_before = torch.cuda.memory_reserved()
+        model = self.model
+        graph = model.predictor_graph
+        self.graph_settings = {
+            "max_seq_len": model.talker_graph.max_seq_len,
+            "predictor": {"do_sample": graph.do_sample, "top_k": graph.top_k,
+                          "top_p": graph.top_p, "temperature": graph.temperature},
+        }
+        del graph
+        slots = tensor_slots(torch_components(model), "cuda")
+        self._reserve_host(self._park_bytes(slots))
+        with self.state_lock:
+            self.residency = "parking"
+        self.parked_slots = slots
+        try:
+            # Graph replays read fixed addresses, so the graphs, their memory
+            # pools and static KV caches go; wake captures fresh ones.
+            model.predictor_graph = None
+            model.talker_graph = None
+            model._warmed_up = False
+            self.host_cursor = 0
+            count = move_tensors(slots, self._to_host)
+            torch.cuda.synchronize()
+            # Host copies stay valid through a wake, so a failed wake can return here.
+            self.parked_views = [(table, name, is_parameter, table[name].data if is_parameter else table[name])
+                                 for table, name, is_parameter in slots]
+        except Exception:
+            log.exception("Parking failed; restoring the model to the GPU")
+            self._wake("park rollback")
+            return
+        gc.collect()
+        # Each capture runs on a fresh side stream, and PyTorch keeps a cuBLAS
+        # workspace per stream: about 17 MB more per wake unless released.
+        # Safe here: the graphs that used them are gone and the GPU is idle.
+        clear_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+        if clear_workspaces:
+            clear_workspaces()
+        torch.cuda.empty_cache()
+        seconds = time.perf_counter() - started
+        reserved_after = torch.cuda.memory_reserved()
+        with self.state_lock:
+            self.residency = "parked"
+            self.park_count += 1
+            self.last_park = {
+                "reason": reason, "seconds": round(seconds, 3), "tensors": count,
+                "pinned_host_memory": self.host_pinned,
+                "host_buffer_mb": round(self.host_buffer.numel() / 1024**2, 1),
+                "torch_reserved_mb_before": round(reserved_before / 1024**2, 1),
+                "torch_reserved_mb_after": round(reserved_after / 1024**2, 1),
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        log.info("Parked %s model in host RAM (%s) in %.2fs: PyTorch reserved %.0f -> %.0f MB",
+                 self.model_kind, reason, seconds, reserved_before / 1024**2, reserved_after / 1024**2)
+
+    @staticmethod
+    def _park_bytes(slots):
+        return sum(_aligned(entry[3].nbytes) for entry in unique_tensors(slots))
+
+    def _reserve_host(self, nbytes):
+        """One page-locked host buffer for parked weights, kept for reuse.
+
+        PyTorch's pinned allocator takes seconds per park on WSL2 (one
+        cudaHostAlloc per tensor, each rounded up to a power of two), and every
+        CUDA graph capture frees its cache again, adding most of a second to
+        each wake. A single registered buffer avoids both.
+        """
+        torch = self.torch
+        if self.host_buffer is not None and self.host_buffer.numel() >= nbytes:
+            return
+        self._release_host()
+        buffer = torch.empty(nbytes, dtype=torch.uint8)
+        result = []
+        # CUDA's last-error state is per thread: a failed registration in a
+        # helper thread cannot surface later as an unrelated kernel error.
+        helper = threading.Thread(target=lambda: result.append(
+            torch.cuda.cudart().cudaHostRegister(buffer.data_ptr(), nbytes, 0)), name="host-register")
+        helper.start()
+        helper.join()
+        self.host_pinned = bool(result) and int(result[0]) == 0
+        if not self.host_pinned:
+            # Pageable memory still avoids a disk load; it only copies slower.
+            log.warning("Could not page-lock %.0f MB of host memory (%s); parking in pageable memory",
+                        nbytes / 1024**2, result[0] if result else "no result")
+        self.host_buffer = buffer
+
+    def _release_host(self):
+        if self.host_buffer is not None and self.host_pinned:
+            self.torch.cuda.cudart().cudaHostUnregister(self.host_buffer.data_ptr())
+        self.host_buffer = None
+        self.host_pinned = False
+
+    def _to_host(self, tensor):
+        """Copy one tensor into the next slice of the host buffer."""
+        if not tensor.is_contiguous():
+            return tensor.to("cpu")
+        start = self.host_cursor
+        self.host_cursor += _aligned(tensor.nbytes)
+        host = self.host_buffer[start:start + tensor.nbytes].view(tensor.dtype).view(tensor.shape)
+        host.copy_(tensor, non_blocking=self.host_pinned)
+        return host
+
+    def _wake(self, reason):
+        """Restore parked weights and recapture CUDA graphs. Caller holds gpu_lock."""
+        from faster_qwen3_tts.predictor_graph import PredictorGraph
+        from faster_qwen3_tts.talker_graph import TalkerGraph
+
+        torch = self.torch
+        model = self.model
+        started = time.perf_counter()
+        with self.state_lock:
+            self.residency = "waking"
+        try:
+            move_tensors(self.parked_slots, lambda tensor: tensor.to(model.device, non_blocking=True))
+            torch.cuda.synchronize()
+            weights_seconds = time.perf_counter() - started
+            # Rebuild exactly as FasterQwen3TTS.from_pretrained does.
+            qwen = model.model.model
+            talker = qwen.talker
+            talker_config = qwen.config.talker_config
+            model.predictor_graph = PredictorGraph(
+                talker.code_predictor, talker.code_predictor.model.config, talker_config.hidden_size,
+                device=model.device, dtype=model.dtype, **self.graph_settings["predictor"],
+            )
+            model.talker_graph = TalkerGraph(
+                talker.model, talker_config, device=model.device, dtype=model.dtype,
+                max_seq_len=self.graph_settings["max_seq_len"],
+            )
+            model.warmup(prefill_len=100)
+            if not model._warmed_up:
+                raise RuntimeError("CUDA graph warmup did not complete")
+            verify_cuda_parameters(model)
+        except Exception:
+            log.exception("Waking the model failed; returning it to host RAM so a later request can retry")
+            try:
+                model.predictor_graph = model.talker_graph = None
+                model._warmed_up = False
+                for table, name, is_parameter, host in self.parked_views:
+                    if is_parameter:
+                        table[name].data = host
+                    else:
+                        table[name] = host
+                gc.collect()
+                torch.cuda.empty_cache()
+                with self.state_lock:
+                    self.residency = "parked"
+            except Exception:
+                log.exception("Could not return the model to host RAM")
+                with self.state_lock:
+                    self.state = "failed"
+                    self.error = "The model could not be restored to the GPU; restart the service"
+            raise
+        self.parked_slots = self.parked_views = None
+        seconds = time.perf_counter() - started
+        with self.state_lock:
+            self.residency = "resident"
+            self.wake_count += 1
+            self.last_wake = {
+                "reason": reason, "seconds": round(seconds, 3),
+                "weights_seconds": round(weights_seconds, 3),
+                "graph_capture_seconds": round(seconds - weights_seconds, 3),
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        log.info("Woke %s model (%s) in %.2fs: weights %.2fs, CUDA graphs %.2fs",
+                 self.model_kind, reason, seconds, weights_seconds, seconds - weights_seconds)
 
     def _require_ready(self):
         if self.state != "ready":
             raise NotReady(self.error or "Models are loading or the default voice is being designed")
 
-    def _load_model(self, kind):
+    def _load_model(self, kind, reason="request"):
         if self.model_kind == kind and self.model is not None:
+            if self.residency == "parked":
+                self._wake(reason)
             return
         from huggingface_hub import snapshot_download
         from qwen_tts import Qwen3TTSModel
 
         if self.model is not None:
+            # The host buffer is kept: the Base model has the same size when reloaded.
             self.model = None
+            self.parked_slots = self.parked_views = None
             self.prompt_cache.clear()
             self.warmed_voices.clear()
             gc.collect()
             self.torch.cuda.empty_cache()
+        with self.state_lock:
+            self.residency = None
         self.model_kind = None
         model_id = self.config[f"{kind}_model"]
         log.info("Loading %s on CUDA", model_id)
@@ -242,6 +614,8 @@ class QwenEngine:
         self.model = model
         self.model_kind = kind
         self.model_snapshot = Path(model_path).name
+        with self.state_lock:
+            self.residency = "resident"
 
     def _wav(self, waveform, sample_rate):
         import numpy as np
@@ -289,7 +663,7 @@ class QwenEngine:
         description = clean_text(description, field="description", limit=2000)
         reference_text = clean_text(reference_text, field="reference_text", limit=1000)
         with self.cancellations.track(identifier) as event:
-            with cancellable_lock(self.gpu_lock, event):
+            with self._gpu_session(event):
                 result = self._design(name, description, reference_text, event)
                 self._load_model("base")
                 self._warm_voice(name)
@@ -306,8 +680,8 @@ class QwenEngine:
             }
         return self.prompt_cache[name]
 
-    def _warm_voice(self, name):
-        if name in self.warmed_voices:
+    def _warm_voice(self, name, force=False, first_chunk_only=False):
+        if name in self.warmed_voices and not force:
             return
         log.info("Warming streaming decode and reference voice %s", name)
         with self.torch.inference_mode(), closing(self.model.generate_voice_clone_streaming(
@@ -315,7 +689,8 @@ class QwenEngine:
             **self._voice_prompt(name), chunk_size=self.chunk_size, max_new_tokens=64,
         )) as chunks:
             for _ in chunks:
-                pass
+                if first_chunk_only:
+                    break
         self.torch.cuda.synchronize()
         self.warmed_voices.add(name)
 
@@ -349,8 +724,10 @@ class QwenEngine:
         name = voice_name(name)
         started = time.perf_counter()
         with self.cancellations.track(identifier) as event:
-            with cancellable_lock(self.gpu_lock, event):
+            with self._gpu_session(event):
+                wakes = self.wake_count
                 self._load_model("base")
+                woke = self.wake_count != wakes
                 prompt = self._voice_prompt(name)
                 check_cancelled(event)
                 self.torch.cuda.reset_peak_memory_stats()
@@ -428,6 +805,9 @@ class QwenEngine:
                     # than playback. Excludes time paused at yields by a reader.
                     "real_time_factor": round(compute_seconds / duration, 3),
                     "peak_cuda_memory_mb": round(self.torch.cuda.max_memory_allocated() / 1024**2, 1),
+                    # first_audio_ms includes this restore when the request found the model parked.
+                    "woke_model": woke,
+                    "wake_seconds": self.last_wake["seconds"] if woke else 0.0,
                 }
                 with self.state_lock:
                     self.last_synthesis = metrics

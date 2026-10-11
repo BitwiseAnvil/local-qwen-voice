@@ -43,6 +43,24 @@ def wait_ready(client, timeout):
     raise RuntimeError(f"TTS did not become ready in {timeout}s: {last}")
 
 
+def wake_and_wait(client, timeout=60):
+    """Restore a model parked by idle unload, so measurements show steady state."""
+    state = client.health()
+    if state.get("residency") in (None, "resident"):
+        return state
+    client.wake()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = client.health()
+        # A background wake finishes with a short warm-up generation.
+        if state.get("residency") == "resident" and not state.get("active_requests"):
+            return state
+        if state.get("status") == "failed":
+            raise RuntimeError(state.get("error") or "Engine failed while waking")
+        time.sleep(0.25)
+    raise RuntimeError(f"TTS did not wake in {timeout}s: {state.get('residency')}")
+
+
 def verify_sample(audio, metrics):
     info = wav_info(audio)
     if metrics.get("device") != "cuda:0":
@@ -129,7 +147,7 @@ def verify_interactive(metrics, max_first_audio_ms=1000):
 def main():
     project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("health", "wait", "smoke", "benchmark"))
+    parser.add_argument("command", choices=("health", "wait", "wake", "smoke", "benchmark"))
     parser.add_argument("--url", default=backend_url(project))
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--play", action="store_true")
@@ -137,11 +155,15 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--max-first-audio-ms", type=float, default=1000)
     parser.add_argument("--require-interactive", action="store_true")
+    parser.add_argument("--keep-resident", type=float, default=0,
+                        help="wake: keep the model on the GPU for at least this many seconds")
     args = parser.parse_args()
     client = EngineClient(args.url)
     try:
         if args.command == "health":
             result = client.health()
+        elif args.command == "wake":
+            result = client.wake(args.keep_resident)
         elif args.command == "wait":
             print("Waiting for the GPU models and designed voice...", flush=True)
             result = wait_ready(client, args.timeout)
@@ -149,6 +171,7 @@ def main():
             state = client.health()
             if state.get("status") != "ready":
                 raise RuntimeError(state.get("error") or "Engine is still loading")
+            wake_and_wait(client)
             voice = default_voice(project)
             runs = args.runs if args.command == "benchmark" else 1
             if not 1 <= runs <= 10:

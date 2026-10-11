@@ -23,6 +23,9 @@ def dispatch(engine, method, path, body=None):
         return (200 if path == "/health" or state["status"] == "ready" else 503), state, {}
     if method == "GET" and path == "/voices":
         return 200, {"voices": engine.store.list(), "default_voice": engine.config["name"]}, {}
+    if method == "POST" and path == "/wake":
+        # Returns at once; a parked model is restored in the background.
+        return 202, engine.request_wake(body.get("keep_resident_seconds", 0)), {}
     if method == "POST" and path == "/cancel":
         active = engine.cancellations.cancel(body.get("request_id"))
         return 200, {"cancelled": True, "was_active": active}, {}

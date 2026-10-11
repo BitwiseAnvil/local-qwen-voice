@@ -51,6 +51,9 @@ class EngineClient:
     def health(self):
         return self.request("GET", "/health", timeout=2)
 
+    def wake(self, keep_resident_seconds=0):
+        return self.request("POST", "/wake", {"keep_resident_seconds": keep_resident_seconds}, timeout=5)
+
     def voices(self):
         return self.request("GET", "/voices", timeout=5)
 
