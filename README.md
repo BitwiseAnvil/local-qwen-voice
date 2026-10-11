@@ -28,7 +28,7 @@ hold a key to talk, release, and hear the answer.
   to design more voices at any time.
 - **Stops when you say so.** Say "stop" or "quiet" and speech cancels
   immediately for that reply.
-- **Gives the GPU back when idle.** After two minutes without speech, the model
+- **Gives the GPU back when idle.** After 15 seconds without speech, the model
   moves to host RAM, freeing about 5.5 GB of VRAM. The next reply brings it back
   in about a second.
 - **Stays private.** Text goes only to a container on `127.0.0.1`. After the
@@ -199,7 +199,7 @@ Copy `.env.example` to `.env` to change these settings:
 | `TTS_EXPECTED_GPU` | *(empty)* | If set, refuse to start unless the GPU name contains this text, e.g. `RTX 5090`. |
 | `TTS_PORT` | `8765` | Port published on `127.0.0.1` only. |
 | `TTS_CHUNK_FRAMES` | `4` | Codec frames per packet, 1-12, about a third of a second of audio at 4. Smaller can start sooner at more overhead. |
-| `TTS_IDLE_UNLOAD_SECONDS` | `120` | Seconds without speech before the model leaves GPU memory; `0` keeps it loaded. See [Idle GPU memory](#idle-gpu-memory). |
+| `TTS_IDLE_UNLOAD_SECONDS` | `15` | Seconds without speech before the model leaves GPU memory; `0` keeps it loaded. See [Idle GPU memory](#idle-gpu-memory). |
 | `HF_HUB_OFFLINE` | `0` | Set to `1` after both models are cached to block Hugging Face access. |
 
 The bridge reads the same `TTS_PORT` from `.env`; `TTS_URL` can override it with
@@ -207,7 +207,7 @@ another localhost URL. Changes take effect after `docker compose up -d`.
 
 ## Idle GPU memory
 
-When no speech has been requested for `TTS_IDLE_UNLOAD_SECONDS` (two minutes by
+When no speech has been requested for `TTS_IDLE_UNLOAD_SECONDS` (15 seconds by
 default), the engine *parks* the model: it copies the weights into a page-locked
 buffer in host RAM and releases their GPU memory along with the CUDA graphs and
 their static caches. The next request restores the weights over PCIe and
