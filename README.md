@@ -32,8 +32,8 @@ hold a key to talk, release, and hear the answer.
   moves to host RAM, freeing about 2.6 GB of VRAM. The next reply brings it back
   in about 1.4 seconds.
 - **Small footprint.** The talker's weights are stored in 8-bit and the text
-  embedding table stays in host RAM, so the model needs about 2.6 GB of VRAM while
-  speaking (about 5.6 GB in bf16).
+  embedding table stays in host RAM, so the engine uses about 3.3 GB of VRAM while
+  speaking, as Task Manager or `nvidia-smi` shows it (about 6.2 GB in bf16).
 - **Stays private.** Text goes only to a container on `127.0.0.1`. After the
   models download, you can turn off network access to Hugging Face entirely.
 - **Works with Claude Code and Codex CLI.** Registration scripts set up both,
@@ -48,7 +48,7 @@ engine, register the server and set up the speaking rules for you.
 your own sign-in:
 
 - Windows 10 or 11 and an NVIDIA GPU with a current driver that supports CUDA 13.
-  Developed and tested on an RTX 5090; peak GPU memory measured about 2.5 GB.
+  Developed and tested on an RTX 5090; GPU memory while speaking measured about 3.3 GB.
   Other recent NVIDIA GPUs should work if the PyTorch CUDA 13 build supports them.
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) using the
   WSL2 backend with [GPU support](https://docs.docker.com/desktop/features/gpu/),
@@ -231,7 +231,7 @@ Measured on an RTX 5090 under Docker Desktop (WSL2):
 
 | | |
 | --- | --- |
-| GPU memory while speaking | about 2.6 GB reserved by PyTorch (int8 weights, 1024-position context) |
+| GPU memory while speaking | about 3.3 GB (`nvidia-smi`): 2.6 GB reserved by PyTorch plus about 0.7 GB of CUDA context |
 | GPU memory freed by parking | about 2.6 GB: PyTorch reserved drops from 2,646 MB to 42 MB |
 | Still held while parked | about 0.7 GB for the process's CUDA context and loaded kernels; only stopping the container releases it |
 | Park | about 0.3 s |
