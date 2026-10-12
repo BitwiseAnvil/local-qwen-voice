@@ -334,6 +334,38 @@ class EngineLogicTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             verify_cuda_parameters(wrapper)
 
+    def test_host_resident_encoder_is_exempt_but_other_host_parameters_fail(self):
+        def parameter(kind):
+            return SimpleNamespace(device=SimpleNamespace(type=kind))
+
+        class Module:
+            def __init__(self, parameters, children=(), host_resident=False):
+                self.own = parameters
+                self.children = list(children)
+                if host_resident:
+                    self.host_resident = True
+
+            def modules(self):
+                yield self
+                for child in self.children:
+                    yield from child.modules()
+
+            def parameters(self):
+                for module in self.modules():
+                    yield from module.own.values()
+
+            def named_parameters(self):
+                return [(name, value) for module in self.modules() for name, value in module.own.items()]
+
+        encoder = Module({"encoder.weight": parameter("cpu")}, host_resident=True)
+        decoder = Module({"decoder.weight": parameter("cuda")})
+        wrapper = SimpleNamespace(model=Module({"talker.weight": parameter("cuda")}))
+        wrapper.model.speech_tokenizer = SimpleNamespace(model=Module({}, [encoder, decoder]))
+        self.assertEqual(2, verify_cuda_parameters(wrapper))
+        del encoder.host_resident
+        with self.assertRaisesRegex(RuntimeError, "encoder.weight is on"):
+            verify_cuda_parameters(wrapper)
+
     def test_ready_gate_does_not_attempt_inference(self):
         with self.assertRaises(NotReady):
             self.engine.synthesize("Hello", DEFAULT_VOICE, uuid.uuid4().hex)

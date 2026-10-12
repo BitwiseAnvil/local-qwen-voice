@@ -13,6 +13,10 @@ services:
       EXPECTED_GPU_NAME: ${TTS_EXPECTED_GPU:-}
       TTS_CHUNK_FRAMES: ${TTS_CHUNK_FRAMES:-4}
       TTS_IDLE_UNLOAD_SECONDS: ${TTS_IDLE_UNLOAD_SECONDS:-15}
+      TTS_WEIGHT_QUANT: ${TTS_WEIGHT_QUANT:-int8}
+      TTS_MAX_SEQ_LEN: ${TTS_MAX_SEQ_LEN:-1024}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      TRITON_CACHE_DIR: /models/triton-cache
       HF_HOME: /models/huggingface
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
       HF_HUB_DISABLE_TELEMETRY: "1"

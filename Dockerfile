@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir torch==2.11.0 torchaudio==2.11.0 \
 COPY requirements-engine.txt constraints-engine.txt ./
 RUN pip install --no-cache-dir -r requirements-engine.txt -c constraints-engine.txt \
     && pip check
+# Triton builds its kernel launcher with the system C compiler on first use
+# (the int8 decode kernel in local_voice/footprint.py).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY local_voice ./local_voice
 COPY config ./config

@@ -18,6 +18,18 @@ from .voices import VoiceStore
 
 log = logging.getLogger(__name__)
 
+# The 12 Hz codec produces 12.5 frames per second of audio.
+CODEC_FRAME_RATE = 12.5
+# Static-context positions per voice prompt besides its reference audio frames.
+PROMPT_OVERHEAD_FRAMES = 16
+# Positions kept free at the end of the static context.
+CONTEXT_MARGIN_FRAMES = 32
+# Upper bound on codec frames per character of English text, from measurement.
+FRAMES_PER_CHARACTER = 1.25
+MAX_SEGMENT_CHARACTERS = 800
+MIN_SEGMENT_CHARACTERS = 80
+WEIGHT_QUANT_MODES = ("none", "int8")
+
 
 class CancellationRegistry:
     def __init__(self):
@@ -89,12 +101,24 @@ def torch_components(wrapper):
     return components
 
 
+def host_resident_parameters(component):
+    """Parameters of submodules deliberately kept in host RAM (see footprint.py)."""
+    modules = getattr(component, "modules", None)
+    if modules is None:
+        return set()
+    return {id(parameter) for module in modules() if getattr(module, "host_resident", False)
+            for parameter in module.parameters()}
+
+
 def verify_cuda_parameters(wrapper):
     """Check actual model and audio-tokenizer tensors, not just a device label."""
     components = torch_components(wrapper)
     count = 0
     for component in components:
+        exempt = host_resident_parameters(component)
         for name, parameter in component.named_parameters():
+            if id(parameter) in exempt:
+                continue
             count += 1
             if parameter.device.type != "cuda":
                 raise RuntimeError(f"Model tensor {name} is on {parameter.device}; CUDA is required")
@@ -197,6 +221,16 @@ class QwenEngine:
         self.chunk_size = int(os.environ.get("TTS_CHUNK_FRAMES", "4"))
         if not 1 <= self.chunk_size <= 12:
             raise ValueError("TTS_CHUNK_FRAMES must be between 1 and 12")
+        # Weight storage for the talker's transformer linears; see footprint.py.
+        self.weight_quant = os.environ.get("TTS_WEIGHT_QUANT", "none").strip().lower() or "none"
+        if self.weight_quant not in WEIGHT_QUANT_MODES:
+            raise ValueError(f"TTS_WEIGHT_QUANT must be one of {', '.join(WEIGHT_QUANT_MODES)}")
+        # Static KV-cache positions: reference prompt plus one text segment's speech.
+        self.max_seq_len = int(os.environ.get("TTS_MAX_SEQ_LEN", "1024"))
+        if not 512 <= self.max_seq_len <= 4096:
+            raise ValueError("TTS_MAX_SEQ_LEN must be between 512 and 4096")
+        self.footprint = None
+        self.prompt_frames = {}
         self.warmed_voices = set()
         # Idle unload: park the Base model's weights in pinned host RAM and drop
         # its CUDA graphs, then restore them when speech is next requested.
@@ -290,6 +324,10 @@ class QwenEngine:
                 "backend": "faster-qwen3-tts",
                 "streaming_protocol": 1,
                 "chunk_frames": self.chunk_size,
+                "weight_quant": self.weight_quant,
+                "max_seq_len": self.max_seq_len,
+                # GPU bytes moved to host RAM or saved by quantization at load.
+                "footprint": self.footprint and dict(self.footprint),
                 "cuda_graphs": bool(self.model_kind == "base" and getattr(self.model, "_warmed_up", False)),
                 # resident, parking, parked (weights in host RAM) or waking.
                 # Requests made while parked wait for the wake and then succeed.
@@ -599,8 +637,10 @@ class QwenEngine:
 
             model = FasterQwen3TTS.from_pretrained(
                 model_path, device="cuda:0", dtype=self.torch.bfloat16,
-                attn_implementation="sdpa", backend="torch", max_seq_len=2048,
+                attn_implementation="sdpa", backend="torch", max_seq_len=self.max_seq_len,
             )
+            # Before warmup: the CUDA graphs capture the layers as they will run.
+            self._shrink(model)
             model.warmup(prefill_len=100)
             if not model._warmed_up:
                 raise RuntimeError("CUDA graph warmup did not complete")
@@ -616,6 +656,35 @@ class QwenEngine:
         self.model_snapshot = Path(model_path).name
         with self.state_lock:
             self.residency = "resident"
+
+    def _shrink(self, model):
+        """Move prompt-only weights to host RAM and optionally quantize the talker."""
+        from .footprint import offload_encoder, offload_text_embedding, quantize_linears
+
+        torch = self.torch
+        started = time.perf_counter()
+        qwen = model.model.model
+        result = {
+            "text_embedding_host_mb": offload_text_embedding(qwen.talker.model, model.device) / 1024**2,
+            "tokenizer_encoder_host_mb": offload_encoder(qwen.speech_tokenizer.model, model.device) / 1024**2,
+            "int8_linears": 0, "int8_saved_mb": 0.0, "int8_triton_gemv": False,
+        }
+        if self.weight_quant == "int8":
+            count, saved, gemv = quantize_linears(qwen.talker.model.layers)
+            result.update(int8_linears=count, int8_saved_mb=saved / 1024**2, int8_triton_gemv=gemv)
+        # The freed blocks sit between the remaining weights, so the allocator
+        # cannot return them. A round trip through host RAM repacks the weights.
+        slots = tensor_slots(torch_components(model), "cuda")
+        move_tensors(slots, lambda tensor: tensor.to("cpu"))
+        gc.collect()
+        torch.cuda.empty_cache()
+        move_tensors(slots, lambda tensor: tensor.to(model.device))
+        torch.cuda.synchronize()
+        result["torch_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
+        result = {key: round(value, 1) if isinstance(value, float) else value for key, value in result.items()}
+        result["seconds"] = round(time.perf_counter() - started, 3)
+        self.footprint = result
+        log.info("Reduced the Base model's GPU footprint: %s", result)
 
     def _wav(self, waveform, sample_rate):
         import numpy as np
@@ -678,7 +747,21 @@ class QwenEngine:
                 "ref_audio": str(audio_path), "ref_text": metadata["reference_text"],
                 "xvec_only": False, "append_silence": True,
             }
+            # The reference codes (plus the appended 0.5 s of silence) occupy the
+            # start of the static context in every generation with this voice.
+            seconds = wav_info(audio_path.read_bytes())["duration_seconds"] + 0.5
+            self.prompt_frames[name] = int(seconds * CODEC_FRAME_RATE) + 1 + PROMPT_OVERHEAD_FRAMES
         return self.prompt_cache[name]
+
+    def _segment_limit(self, name):
+        """Characters per text segment so one segment's speech fits the static context."""
+        self._voice_prompt(name)
+        budget = self.max_seq_len - self.prompt_frames[name] - CONTEXT_MARGIN_FRAMES
+        limit = min(MAX_SEGMENT_CHARACTERS, int(budget / FRAMES_PER_CHARACTER))
+        if limit < MIN_SEGMENT_CHARACTERS:
+            raise RuntimeError(f"The reference audio of voice {name} is too long for TTS_MAX_SEQ_LEN={self.max_seq_len}; "
+                               "raise TTS_MAX_SEQ_LEN")
+        return limit
 
     def _warm_voice(self, name, force=False, first_chunk_only=False):
         if name in self.warmed_voices and not force:
@@ -729,6 +812,7 @@ class QwenEngine:
                 self._load_model("base")
                 woke = self.wake_count != wakes
                 prompt = self._voice_prompt(name)
+                limit = self._segment_limit(name)
                 check_cancelled(event)
                 self.torch.cuda.reset_peak_memory_stats()
                 yield "H", dict(FORMAT)
@@ -739,7 +823,8 @@ class QwenEngine:
                 first_audio_ms = None
                 # Split only to bound the model's static context. Playback keeps
                 # draining one continuous buffer while the next segment generates.
-                segments = sentence_chunks(text, limit=800)
+                segments = sentence_chunks(text, limit=limit)
+                context_positions = 0
                 for segment in segments:
                     check_cancelled(event)
                     with self.torch.inference_mode(), closing(self.model.generate_voice_clone_streaming(
@@ -777,8 +862,11 @@ class QwenEngine:
                         # inspect its last replay position instead of declaring
                         # a potentially truncated utterance completed.
                         graph = getattr(self.model, "talker_graph", None)
-                        if graph is not None and graph.cache_position.item() >= graph.max_seq_len - 2:
-                            raise RuntimeError("Speech reached its model context limit; use shorter text or reference audio")
+                        if graph is not None:
+                            position = graph.cache_position.item()
+                            context_positions = max(context_positions, position + 1)
+                            if position >= graph.max_seq_len - 2:
+                                raise RuntimeError("Speech reached its model context limit; use shorter text or reference audio")
                 check_cancelled(event)
                 if not audio_bytes or peak < 0.0001:
                     raise RuntimeError("The model returned empty or silent audio")
@@ -801,6 +889,10 @@ class QwenEngine:
                     "audio_bytes": audio_bytes,
                     "audio_chunks": audio_chunks,
                     "text_segments": len(segments),
+                    # Static-context positions used by the longest segment, of max_seq_len.
+                    "context_positions": context_positions,
+                    "max_seq_len": self.max_seq_len,
+                    "weight_quant": self.weight_quant,
                     # Consistent with the original API: lower than 1 is faster
                     # than playback. Excludes time paused at yields by a reader.
                     "real_time_factor": round(compute_seconds / duration, 3),

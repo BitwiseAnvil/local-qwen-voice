@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
+import wave
 
 from local_voice.cli import stream_sample, verify_interactive
 from local_voice.client import EngineClient
@@ -378,31 +379,113 @@ class StreamingEngineTests(unittest.TestCase):
         self.assertTrue(Path(calls[0]["ref_audio"]).is_file())
         self.assertFalse(calls[0]["xvec_only"])
 
-    def test_load_selects_cuda_graph_backend_and_captures_before_ready(self):
-        called = {}
+    def load_base(self, environment):
+        events = []
+        talker_model = SimpleNamespace(layers="talker layers")
+        tokenizer_model = SimpleNamespace(encoder="encoder", modules=lambda: iter(()))
+        qwen = SimpleNamespace(talker=SimpleNamespace(model=talker_model), named_parameters=lambda: [],
+                               modules=lambda: iter(()), speech_tokenizer=SimpleNamespace(model=tokenizer_model))
 
         class FasterModel:
             _warmed_up = False
+            device = "cuda:0"
+            model = SimpleNamespace(model=qwen)
 
             @classmethod
             def from_pretrained(cls, path, **kwargs):
-                called.update(kwargs)
+                events.append(("load", kwargs))
                 return cls()
 
             def warmup(self, prefill_len):
                 self._warmed_up = True
-                called["warmed"] = True
+                events.append(("warmup", prefill_len))
 
-        self.engine.model = None
+        footprint = SimpleNamespace(
+            offload_text_embedding=lambda module, device: events.append(("text embedding", module, device)) or 600 * 1024**2,
+            offload_encoder=lambda module, device: events.append(("encoder", module, device)) or 100 * 1024**2,
+            quantize_linears=lambda module: events.append(("int8", module)) or (196, 1400 * 1024**2, True),
+        )
+        with patch.dict("os.environ", environment):
+            engine = QwenEngine(PROJECT / "config" / "voice.json", self.engine.store.directory)
+        engine.torch = SimpleNamespace(bfloat16="bf16", cuda=SimpleNamespace(
+            empty_cache=lambda: events.append(("empty cache",)), synchronize=lambda: None,
+            memory_reserved=lambda: 2560 * 1024**2))
         with patch.dict(sys.modules, {
             "huggingface_hub": SimpleNamespace(snapshot_download=lambda **kwargs: "/models/revision"),
             "qwen_tts": SimpleNamespace(Qwen3TTSModel=None),
             "faster_qwen3_tts": SimpleNamespace(FasterQwen3TTS=FasterModel),
+            "local_voice.footprint": footprint,
         }):
-            self.engine._load_model("base")
-        self.assertEqual("torch", called["backend"])
-        self.assertEqual("cuda:0", called["device"])
-        self.assertTrue(called["warmed"])
+            engine._load_model("base")
+        return engine, events, talker_model, tokenizer_model
+
+    def test_load_selects_cuda_graph_backend_and_captures_before_ready(self):
+        engine, events, talker_model, tokenizer_model = self.load_base({})
+        load = events[0][1]
+        self.assertEqual("torch", load["backend"])
+        self.assertEqual("cuda:0", load["device"])
+        self.assertEqual(1024, load["max_seq_len"])
+        # Prompt-only weights leave the GPU before the graphs are captured; no int8 by default.
+        self.assertEqual([("text embedding", talker_model, "cuda:0"), ("encoder", tokenizer_model, "cuda:0"),
+                          ("empty cache",), ("warmup", 100)], events[1:])
+        self.assertEqual("none", engine.health()["weight_quant"])
+        self.assertEqual(600.0, engine.health()["footprint"]["text_embedding_host_mb"])
+        self.assertEqual(0, engine.health()["footprint"]["int8_linears"])
+        self.assertEqual(2560.0, engine.health()["footprint"]["torch_reserved_mb"])
+
+    def test_int8_quantizes_the_talker_layers_before_graph_capture(self):
+        engine, events, _, _ = self.load_base({"TTS_WEIGHT_QUANT": "int8", "TTS_MAX_SEQ_LEN": "2048"})
+        self.assertEqual(2048, events[0][1]["max_seq_len"])
+        names = [event[0] for event in events]
+        self.assertEqual(["load", "text embedding", "encoder", "int8", "empty cache", "warmup"], names)
+        self.assertEqual(("int8", "talker layers"), events[3])
+        footprint = engine.health()["footprint"]
+        self.assertEqual((196, 1400.0, True), (footprint["int8_linears"], footprint["int8_saved_mb"], footprint["int8_triton_gemv"]))
+        self.assertEqual("int8", engine.health()["weight_quant"])
+
+    def test_footprint_settings_are_validated(self):
+        for environment in ({"TTS_WEIGHT_QUANT": "fp4"}, {"TTS_MAX_SEQ_LEN": "256"}, {"TTS_MAX_SEQ_LEN": "8192"}):
+            with self.subTest(environment=environment), patch.dict("os.environ", environment), self.assertRaises(ValueError):
+                QwenEngine(PROJECT / "config" / "voice.json", self.engine.store.directory)
+        with patch.dict("os.environ", {"TTS_WEIGHT_QUANT": " INT8 "}):
+            self.assertEqual("int8", QwenEngine(PROJECT / "config" / "voice.json", self.engine.store.directory).weight_quant)
+
+    def test_segment_limit_leaves_room_for_the_reference_prompt(self):
+        # A 0.01 s reference plus 0.5 s of silence is 23 positions with the prompt overhead.
+        self.assertEqual(int((1024 - 23 - 32) / 1.25), self.engine._segment_limit(DEFAULT_VOICE))
+        self.engine.max_seq_len = 2048
+        self.assertEqual(800, self.engine._segment_limit(DEFAULT_VOICE))
+        self.engine.max_seq_len = 1024
+        long_reference = struct.pack("<h", 1000) * (24000 * 40)
+        with io.BytesIO() as output:
+            with wave.open(output, "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(24000)
+                stream.writeframes(long_reference)
+            self.engine.store.save("long_reference", output.getvalue(), {"reference_text": "A long reference."})
+        # 40.5 s of reference is 507 positions: (1024 - 507 - 16 - 32) / 1.25 characters remain.
+        self.assertEqual(375, self.engine._segment_limit("long_reference"))
+        self.engine.max_seq_len = 600
+        with self.assertRaisesRegex(RuntimeError, "too long for TTS_MAX_SEQ_LEN=600"):
+            self.engine._segment_limit("long_reference")
+
+    def test_long_reply_segments_respect_the_voice_limit_and_report_context_use(self):
+        segments = []
+
+        def generate(**kwargs):
+            segments.append(kwargs["text"])
+            yield PCM, 24000, {"steps": 4}
+
+        self.model(generate)
+        self.engine.model.talker_graph = SimpleNamespace(max_seq_len=1024, cache_position=SimpleNamespace(item=lambda: 700))
+        self.engine._segment_limit = lambda name: 300
+        text = "A complete sentence with a natural ending. " * 30
+        metrics = list(self.engine.stream_synthesize(text, DEFAULT_VOICE, uuid.uuid4().hex))[-1][1]
+        self.assertTrue(all(len(segment) <= 300 for segment in segments))
+        self.assertEqual("".join(text.split()), "".join("".join(segments).split()))
+        self.assertEqual(701, metrics["context_positions"])
+        self.assertEqual(1024, metrics["max_seq_len"])
 
 
 class FakeSocket:

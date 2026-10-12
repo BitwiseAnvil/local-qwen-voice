@@ -29,8 +29,11 @@ hold a key to talk, release, and hear the answer.
 - **Stops when you say so.** Say "stop" or "quiet" and speech cancels
   immediately for that reply.
 - **Gives the GPU back when idle.** After 15 seconds without speech, the model
-  moves to host RAM, freeing about 5.5 GB of VRAM. The next reply brings it back
-  in about a second.
+  moves to host RAM, freeing about 2.6 GB of VRAM. The next reply brings it back
+  in about 1.4 seconds.
+- **Small footprint.** The talker's weights are stored in 8-bit and the text
+  embedding table stays in host RAM, so the model needs about 2.6 GB of VRAM while
+  speaking (about 5.6 GB in bf16).
 - **Stays private.** Text goes only to a container on `127.0.0.1`. After the
   models download, you can turn off network access to Hugging Face entirely.
 - **Works with Claude Code and Codex CLI.** Registration scripts set up both,
@@ -45,7 +48,7 @@ engine, register the server and set up the speaking rules for you.
 your own sign-in:
 
 - Windows 10 or 11 and an NVIDIA GPU with a current driver that supports CUDA 13.
-  Developed and tested on an RTX 5090; peak GPU memory measured about 4.7 GB.
+  Developed and tested on an RTX 5090; peak GPU memory measured about 2.5 GB.
   Other recent NVIDIA GPUs should work if the PyTorch CUDA 13 build supports them.
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) using the
   WSL2 backend with [GPU support](https://docs.docker.com/desktop/features/gpu/),
@@ -200,6 +203,8 @@ Copy `.env.example` to `.env` to change these settings:
 | `TTS_PORT` | `8765` | Port published on `127.0.0.1` only. |
 | `TTS_CHUNK_FRAMES` | `4` | Codec frames per packet, 1-12, about a third of a second of audio at 4. Smaller can start sooner at more overhead. |
 | `TTS_IDLE_UNLOAD_SECONDS` | `15` | Seconds without speech before the model leaves GPU memory; `0` keeps it loaded. See [Idle GPU memory](#idle-gpu-memory). |
+| `TTS_WEIGHT_QUANT` | `int8` | Talker weight storage: `int8` (about 1.3 GB less VRAM) or `none` (bf16). |
+| `TTS_MAX_SEQ_LEN` | `1024` | Static context positions (512-4096). Long replies are split to fit; `2048` restores the old size. |
 | `HF_HUB_OFFLINE` | `0` | Set to `1` after both models are cached to block Hugging Face access. |
 
 The bridge reads the same `TTS_PORT` from `.env`; `TTS_URL` can override it with
@@ -226,14 +231,15 @@ Measured on an RTX 5090 under Docker Desktop (WSL2):
 
 | | |
 | --- | --- |
-| GPU memory freed by parking | about 5.5 GB (`nvidia-smi`): the container drops from about 6.2 GB to 0.7 GB |
+| GPU memory while speaking | about 2.6 GB reserved by PyTorch (int8 weights, 1024-position context) |
+| GPU memory freed by parking | about 2.6 GB: PyTorch reserved drops from 2,646 MB to 42 MB |
 | Still held while parked | about 0.7 GB for the process's CUDA context and loaded kernels; only stopping the container releases it |
-| Park | about 0.35 s |
-| Restore | about 1.1 s: 0.16 s for weights, about 1 s to recapture CUDA graphs |
-| First audio when a request finds the model parked | about 1.5 s, instead of about 0.2 s |
+| Park | about 0.3 s |
+| Restore | about 1.4 s: 0.12 s for weights, about 1.3 s to recapture CUDA graphs |
+| First audio when a request finds the model parked | about 1.8 s, instead of about 0.26 s |
 | First audio when a `/wake` hint arrives at least 1.5 s earlier | about 0.2 s, the same as if it had never been parked |
 | Steady-state speed | unchanged |
-| Host RAM | about 4 GB more, page-locked once at startup and reused |
+| Host RAM | about 2 GB more for the parked weights, page-locked once at startup and reused |
 
 Restores take longer, up to about 2 s, while other work is using the GPU.
 
