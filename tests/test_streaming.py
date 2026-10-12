@@ -452,9 +452,9 @@ class StreamingEngineTests(unittest.TestCase):
 
     def test_segment_limit_leaves_room_for_the_reference_prompt(self):
         # A 0.01 s reference plus 0.5 s of silence is 23 positions with the prompt overhead.
-        self.assertEqual(int((1024 - 23 - 32) / 1.25), self.engine._segment_limit(DEFAULT_VOICE))
-        self.engine.max_seq_len = 2048
         self.assertEqual(800, self.engine._segment_limit(DEFAULT_VOICE))
+        self.engine.max_seq_len = 512
+        self.assertEqual(int((512 - 23 - 32) / 1.1), self.engine._segment_limit(DEFAULT_VOICE))
         self.engine.max_seq_len = 1024
         long_reference = struct.pack("<h", 1000) * (24000 * 40)
         with io.BytesIO() as output:
@@ -464,8 +464,8 @@ class StreamingEngineTests(unittest.TestCase):
                 stream.setframerate(24000)
                 stream.writeframes(long_reference)
             self.engine.store.save("long_reference", output.getvalue(), {"reference_text": "A long reference."})
-        # 40.5 s of reference is 507 positions: (1024 - 507 - 16 - 32) / 1.25 characters remain.
-        self.assertEqual(375, self.engine._segment_limit("long_reference"))
+        # 40.5 s of reference is 507 positions: (1024 - 507 - 16 - 32) / 1.1 characters remain.
+        self.assertEqual(426, self.engine._segment_limit("long_reference"))
         self.engine.max_seq_len = 600
         with self.assertRaisesRegex(RuntimeError, "too long for TTS_MAX_SEQ_LEN=600"):
             self.engine._segment_limit("long_reference")

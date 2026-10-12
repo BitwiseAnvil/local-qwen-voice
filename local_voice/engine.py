@@ -24,8 +24,9 @@ CODEC_FRAME_RATE = 12.5
 PROMPT_OVERHEAD_FRAMES = 16
 # Positions kept free at the end of the static context.
 CONTEXT_MARGIN_FRAMES = 32
-# Upper bound on codec frames per character of English text, from measurement.
-FRAMES_PER_CHARACTER = 1.25
+# Codec frames per character of English text, with margin: measured 0.65 median
+# and 0.81 at most over about 50 sentences and paragraphs.
+FRAMES_PER_CHARACTER = 1.1
 MAX_SEGMENT_CHARACTERS = 800
 MIN_SEGMENT_CHARACTERS = 80
 WEIGHT_QUANT_MODES = ("none", "int8")
